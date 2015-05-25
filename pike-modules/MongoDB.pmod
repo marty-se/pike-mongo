@@ -8,6 +8,9 @@ constant OP_GET_MORE = 2005;
 constant OP_DELETE = 2006;
 constant OP_KILL_CURSORS = 2007;
 
+constant RESP_BIT_CURSOR_NOT_FOUND = 1;
+constant RESP_BIT_ERROR = 1 << 1;
+
 typedef array|mapping(string:mixed) Documents;
 constant header_len = 16;
 
@@ -19,6 +22,7 @@ class Request
   protected int request_id;
   protected Documents request_documents;
   protected function(Request,void|Documents:void) cb;
+  protected int cursor_id;
 
   string db_name()
   {
@@ -35,7 +39,7 @@ class Request
     constant payload_head_size = 20;
     array(int) heads = buf->sscanf ("%-4c%-8c%-4c%-4c");
     int response_flags = heads[0];
-    int cursor_id = heads[1];
+    cursor_id = heads[1];
     int starting_from = heads[2];
     int number_returned = heads[3];
 
@@ -49,14 +53,36 @@ class Request
       documents_len -= bson_len;
     }
 
+    int cursor_not_found = (response_flags & RESP_BIT_CURSOR_NOT_FOUND) > 0;
+    int error = (response_flags & RESP_BIT_ERROR) > 0;
+
     if (cb) {
       cb (this, docs);
+      cb = 0;
     }
   }
 
   int get_request_id()
   {
     return request_id;
+  }
+
+  void get_more (function(Request,void|Documents:void) cb)
+  {
+    if (!cb) cb = this::cb;
+    if (!cb) error ("No callback in get_more().\n");
+    GetMoreRequest (collection, cb, cursor_id);
+  }
+
+  int(0..1) has_more()
+  {
+    return cursor_id != 0;
+  }
+
+  void kill_cursor()
+  {
+    if (cursor_id)
+      KillCursorRequest (collection, cursor_id);
   }
 
   protected string encode_bson (Documents request_documents)
@@ -92,6 +118,29 @@ class Request
   }
 }
 
+class KillCursorRequest
+{
+  inherit Request;
+  constant opcode = OP_KILL_CURSORS;
+
+  protected int cursor_id;
+  string format_request()
+  {
+    string payload =
+      sprintf ("%-4c%-4c%-8c",
+	       0, // Reserved field
+	       1, // Number of cursors
+	       cursor_id);
+    return get_header (sizeof (payload)) + payload;
+  }
+
+  protected void create (Collection collection, int cursor_id)
+  {
+    this::cursor_id = cursor_id;
+    ::create (collection, 0);
+  }
+}
+
 class InsertRequest
 {
   inherit Request;
@@ -108,7 +157,7 @@ class InsertRequest
 	       encode_bson (request_documents));
 
     return get_header (sizeof (payload)) + payload;
-  }  
+  }
 }
 
 class UpdateRequest
@@ -194,14 +243,141 @@ class QueryRequest
   }
 }
 
+class SyncQueryRequest
+{
+  inherit QueryRequest;
+  Result result;
+
+  Result get_result()
+  {
+    return result;
+  }
+
+  protected void create (Collection collection, void|Documents selector)
+  {
+    result = Result (this);
+    ::create (collection, result->data_callback, selector);
+  }
+}
+
+class Result (protected Request req)
+{
+  protected Thread.Queue buffer = Thread.Queue();
+  protected int cur_row;
+  protected mapping(string:mixed) cur_rec;
+  protected int got_response;
+
+  void data_callback (Request req, Documents docs)
+  {
+    got_response = 1;
+    if (sizeof (docs)) {
+      foreach (docs, mapping(string:mixed) doc)
+	buffer->write (doc);
+    } else {
+      buffer->write (0);
+    }
+  }
+
+  mapping(string:mixed) fetch()
+  {
+    if (cur_rec) cur_row++;
+
+    if (got_response && !buffer->size()) {
+      if (req->has_more())
+	req->get_more (data_callback);
+      else
+	return cur_rec = 0;
+    }
+    return cur_rec = buffer->read();
+  }
+
+  array(mapping(string:mixed)) get_array()
+  {
+    array(mapping(string:mixed)) res = ({});
+    while (mapping(string:mixed) rec = fetch())
+      res += ({ rec });
+    return res;
+  }
+
+  Iterator _get_iterator()
+  {
+    return Iterator();
+  }
+
+  protected class Iterator()
+  {
+    protected int `!() { return !!cur_rec; }
+    int index()
+    {
+      return cur_row;
+    }
+
+    mapping(string:mixed) value()
+    {
+      if (!cur_rec) fetch();
+      return cur_rec;
+    }
+
+    int next()
+    {
+      fetch();
+      return !!cur_rec;
+    }
+  }
+
+  protected void destroy()
+  {
+    req->kill_cursor();
+  }
+
+  protected string _sprintf (int opts)
+  {
+    return opts == 'O' && sprintf ("MongoDB.Result (%d, %d)",
+				   got_response, cur_row);
+  }
+}
+
+class GetMoreRequest
+{
+  inherit Request;
+  constant opcode = OP_GET_MORE;
+
+  string format_request()
+  {
+    int num_return = 100;
+    string payload =
+      sprintf ("%-4c%s.%s\0%-4c%-8c",
+	       0, // Reserved field
+	       db_name(),
+	       collection_name(),
+	       num_return,
+	       cursor_id);
+    return get_header (sizeof (payload)) + payload;
+  }
+
+  protected void create (Collection collection,
+			 function(Request,void|Documents:void) cb,
+			 int cursor_id)
+  {
+    this_program::cursor_id = cursor_id;
+    ::create (collection, cb);
+  }
+}
+
 class Collection
 {
   protected DB db;
   protected string name;
 
-  void query (Documents documents, void|function(Request,void|Documents:void) cb)
+  QueryRequest query (Documents documents,
+		      void|function(Request,void|Documents:void) cb)
   {
-    QueryRequest (this, cb, documents);
+    return QueryRequest (this, cb, documents);
+  }
+
+  SyncQueryRequest sync_query (Documents documents)
+  {
+    return SyncQueryRequest (this, documents);
   }
 
   void insert (Documents documents, void|function(Request:void) cb)
@@ -209,7 +385,8 @@ class Collection
     InsertRequest (this, cb, documents);
   }
 
-  void update (Documents selector, Documents documents, void|function(Request:void) cb)
+  void update (Documents selector, Documents documents,
+	       void|function(Request:void) cb)
   {
     UpdateRequest (this, cb, selector, documents);
   }
@@ -270,10 +447,10 @@ class DB
 
 class Connection
 {
+  protected Pike.Backend backend;
   protected Stdio.File file;
 
   protected mapping(int:Request) active_requests = ([]);
-  protected Request cur_response;
   protected int latest_request_id = 1;
   protected Stdio.Buffer in_buf = Stdio.Buffer();
   protected Stdio.Buffer out_buf = Stdio.Buffer();
@@ -290,32 +467,37 @@ class Connection
   {
     if (sizeof (buf) < header_len)
       return;
-    
+
     int msglen;
     int request_id;
     int response_to;
     int opcode;
 
-    [msglen, request_id, response_to, opcode] = 
+    Stdio.Buffer.RewindKey rewind_key = buf->rewind_key();
+
+    [msglen, request_id, response_to, opcode] =
       buf->sscanf("%-4c%-4c%-4c%-4c");
 
-    if (sizeof (buf) < msglen - header_len)
+    if (sizeof (buf) < msglen - header_len) {
+      rewind_key->rewind();
       return;
+    }
 
     if (Request req = active_requests[response_to]) {
       req->parse_response (buf, msglen - header_len);
+      m_delete (active_requests, response_to);
     }
   }
 
   protected void write_cb (mixed id, Stdio.Buffer buf)
   {
     if (!file->is_open())
-      call_out (connect, 1);
+      backend->call_out (connect, 1);
   }
 
   protected void close_cb()
   {
-    call_out (connect, 1);
+    backend->call_out (connect, 1);
   }
 
   void send_request (Request req)
@@ -334,10 +516,16 @@ class Connection
     if (res) {
       file->set_buffer_mode (in_buf, out_buf);
       file->set_nonblocking (read_cb, write_cb, close_cb);
-      connected_cb (this);
+      call_out (connected_cb, 0, this);
     } else {
-      call_out (connect, 1);
+      backend->call_out (connect, 1);
     }
+  }
+
+  protected void backend_loop()
+  {
+    while (this)
+      backend (3600.0);
   }
 
   void connect()
@@ -345,14 +533,20 @@ class Connection
     if (file) {
       if (file->is_open())
 	file->close();
-    } else
+    } else {
       file = Stdio.File();
+      backend->add_file (file);
+    }
 
     file->async_connect (host, port, got_connection);
   }
 
-  protected void create (function(Connection:void) connected_cb, void|string host, void|int port)
+  protected void create (function(Connection:void) connected_cb,
+			 void|string host, void|int port)
   {
+    backend = Pike.SmallBackend();
+    Thread.Thread (backend_loop);
+
     this_program::connected_cb = connected_cb;
     if (host) this_program::host = host;
     if (port) this_program::port = port;
